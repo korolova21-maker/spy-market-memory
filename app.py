@@ -118,6 +118,14 @@ def add_features(spy, qqq, vix):
     df["ret_10d"] = df["close"].pct_change(10)
     df["ret_20d"] = df["close"].pct_change(20)
 
+    # Calendar / seasonality features
+    df["weekday"] = df.index.day_name()
+    df["weekday_num"] = df.index.weekday
+    df["month"] = df.index.month_name()
+    df["month_num"] = df.index.month
+    df["day_of_month"] = df.index.day
+    df["week_of_year"] = df.index.isocalendar().week.astype(int)
+
     # Distance from trend, raw and ATR-normalised
     for ema in [20, 50, 200]:
         df[f"dist_ema{ema}"] = (df["close"] / df[f"ema_{ema}"]) - 1
@@ -492,12 +500,12 @@ def risk_label(summary, horizon=10):
     med_adverse = summary[f"median_max_adverse_{horizon}d"]
 
     if chance_3 >= 0.25 or chance_2 >= 0.45:
-        return "High downside path risk / reversal-watch"
+        return "High pullback / reversal risk"
     if chance_2 >= 0.30 or med_adverse <= -0.015:
-        return "Moderate downside path risk"
+        return "Moderate pullback risk"
     if med_final > 0 and chance_2 < 0.25:
-        return "Cleaner hold profile"
-    return "Mixed path risk"
+        return "Lower pullback risk"
+    return "Mixed / unclear path risk"
 
 
 def build_risk_patterns(df):
@@ -552,17 +560,175 @@ def risk_pattern_table(df, horizon=10, min_sample=30):
     return out.sort_values(["chance_-2%", "worst10_adverse"], ascending=[False, True]), baseline
 
 
+def render_clean_path_risk_table(summary, horizon=10, baseline=False):
+    """Readable path-risk table. Avoids misaligned metric cards."""
+    prefix = "Baseline " if baseline else ""
+    median_mfe = summary[f"median_max_favourable_{horizon}d"]
+    median_mae = summary[f"median_max_adverse_{horizon}d"]
+    reward_to_pain = np.nan if median_mae == 0 else median_mfe / abs(median_mae)
+
+    rows = [
+        {
+            "Group": "Final outcome",
+            "Metric": f"{prefix}{horizon}D final positive rate",
+            "Value": prob(summary[f"prob_positive_{horizon}d"]),
+            "Meaning": "How often SPY finished higher after the selected window."
+        },
+        {
+            "Group": "Final outcome",
+            "Metric": f"{prefix}Median {horizon}D final return",
+            "Value": pct(summary[f"median_{horizon}d"]),
+            "Meaning": "Typical close-to-close return after the selected window."
+        },
+        {
+            "Group": "Path risk",
+            "Metric": f"Chance of -1% drop inside {horizon}D",
+            "Value": prob(summary[f"chance_down_1pct_{horizon}d"]),
+            "Meaning": "How often SPY fell at least 1% at any point before the window ended."
+        },
+        {
+            "Group": "Path risk",
+            "Metric": f"Chance of -2% drop inside {horizon}D",
+            "Value": prob(summary[f"chance_down_2pct_{horizon}d"]),
+            "Meaning": "More meaningful pullback risk. This matters more than final return for entries."
+        },
+        {
+            "Group": "Path risk",
+            "Metric": f"Chance of -3% drop inside {horizon}D",
+            "Value": prob(summary[f"chance_down_3pct_{horizon}d"]),
+            "Meaning": "Shows sharper downside reversal risk."
+        },
+        {
+            "Group": "Path risk",
+            "Metric": f"Chance of -5% drop inside {horizon}D",
+            "Value": prob(summary[f"chance_down_5pct_{horizon}d"]),
+            "Meaning": "Rare but serious downside move inside the window."
+        },
+        {
+            "Group": "Pain vs reward",
+            "Metric": "Median max favourable move",
+            "Value": pct(median_mfe),
+            "Meaning": "Typical best upside seen inside the window."
+        },
+        {
+            "Group": "Pain vs reward",
+            "Metric": "Median max adverse move",
+            "Value": pct(median_mae),
+            "Meaning": "Typical worst downside seen inside the window."
+        },
+        {
+            "Group": "Pain vs reward",
+            "Metric": "Worst 10% adverse move",
+            "Value": pct(summary[f"worst10_adverse_{horizon}d"]),
+            "Meaning": "Bad-case path risk. In the worst 10% of cases, downside was around this or worse."
+        },
+        {
+            "Group": "Pain vs reward",
+            "Metric": "Reward-to-pain ratio",
+            "Value": "N/A" if pd.isna(reward_to_pain) else f"{reward_to_pain:.2f}",
+            "Meaning": "Median favourable move divided by median adverse move. Above 1 is cleaner; below 1 means pain dominated reward."
+        },
+    ]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def score_explainer_table():
+    rows = [
+        ["Trend score", "How clean the trend is: EMA structure, price vs EMA20/50/200, and EMA slopes.", "Higher = stronger uptrend. Negative = weaker/bearish trend."],
+        ["Extension score", "How stretched price is from normal trend levels: ATR distance from EMA20/50 and Bollinger/Keltner position.", "High positive = overextended upward. High negative = oversold/downside stretch."],
+        ["Duration score", "How long the move has gone without a reset: days above EMA20, days since 1–3% pullback, green streaks.", "Higher = trend is mature/possibly crowded."],
+        ["Candle pressure", "How large and directional the recent candle/range pressure is using ATR, body size, gap, and close location.", "High = strong pressure candle; context decides whether it is ignition or exhaustion."],
+        ["VIX context", "Whether volatility is calm, elevated, or rising relative to recent SPY movement.", "High VIX/rising VIX can increase path risk even if SPY is still up."],
+        ["Extremity score", "Combined score from trend, extension, duration, candle pressure, and VIX.", "+7 to +10 = upside extension/chase risk. -7 to -10 = downside stretch/bounce watch. Near 0 = middle/no clear edge."],
+        ["Deviation score", "A similarity/math score used internally for analogue matching.", "Do not treat it as a trading signal. It only helps find similar historical days."],
+        ["Weekly context", "Weekly green/red streak and recent weekly direction.", "Useful for knowing whether a daily setup is early, mature, or stretched across weeks."],
+    ]
+    return pd.DataFrame(rows, columns=["Label", "What it means", "How to read it"])
+
+
+def seasonality_condition_mask(df, selected_date, condition_name):
+    if condition_name == "All market days":
+        return pd.Series(True, index=df.index)
+    if condition_name == "Current exact market state":
+        current_state = classify_state(df.loc[selected_date])
+        return df.apply(classify_state, axis=1) == current_state
+    if condition_name == "Bullish regime":
+        return (df["close"] > df["ema_200"]) & (df["ema_20"] > df["ema_50"])
+    if condition_name == "Bearish regime":
+        return (df["close"] < df["ema_200"]) | (df["ema_20"] < df["ema_50"])
+    if condition_name == "Upside extension":
+        return df["extremity_score"] >= 4
+    if condition_name == "Extreme upside extension":
+        return df["extremity_score"] >= 7
+    if condition_name == "Oversold / downside stretch":
+        return df["extremity_score"] <= -4
+    if condition_name == "Pullback in uptrend":
+        return (df["close"] > df["ema_200"]) & (df["ema_20"] > df["ema_50"]) & (df["rsi_14"].between(35, 55)) & (df["close"] <= df["ema_20"])
+    return pd.Series(True, index=df.index)
+
+
+def seasonality_table(df, selected_date, horizon=5, condition_name="All market days", group_by="Weekday", min_sample=20):
+    valid = df.loc[df.index <= selected_date].dropna(
+        subset=[f"fwd_ret_{horizon}d", f"max_adverse_{horizon}d", f"max_favourable_{horizon}d"]
+    ).copy()
+
+    mask = seasonality_condition_mask(valid, selected_date, condition_name)
+    filtered = valid[mask.reindex(valid.index).fillna(False)].copy()
+
+    if group_by == "Weekday":
+        group_col = "weekday"
+        order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    elif group_by == "Month":
+        group_col = "month"
+        order = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+    elif group_by == "Day of month":
+        group_col = "day_of_month"
+        order = None
+    else:
+        group_col = "week_of_year"
+        order = None
+
+    baseline = outcome_summary(filtered)
+    rows = []
+    for label, group in filtered.groupby(group_col):
+        if len(group) < min_sample:
+            continue
+        s = outcome_summary(group)
+        rows.append({
+            "period": label,
+            "sample_size": len(group),
+            "positive_rate": s[f"prob_positive_{horizon}d"],
+            "baseline_positive_rate": baseline[f"prob_positive_{horizon}d"],
+            "edge_vs_condition": s[f"prob_positive_{horizon}d"] - baseline[f"prob_positive_{horizon}d"],
+            "median_return": s[f"median_{horizon}d"],
+            "chance_-2%_inside": s[f"chance_down_2pct_{horizon}d"],
+            "median_max_adverse": s[f"median_max_adverse_{horizon}d"],
+            "worst10_adverse": s[f"worst10_adverse_{horizon}d"],
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out, baseline, len(filtered)
+
+    if order is not None:
+        out["_order"] = out["period"].apply(lambda x: order.index(x) if x in order else 999)
+        out = out.sort_values("_order").drop(columns=["_order"])
+    else:
+        out = out.sort_values("period")
+    return out, baseline, len(filtered)
+
+
 # =====================================================
 # UI
 # =====================================================
 
 st.title("🧠 SPY Market Memory")
-st.caption("Historical market-state memory for SPY. Daily-data MVP with Signal Forensics built in.")
+st.caption("Historical market-state memory for SPY. Daily-data MVP with Signal Forensics, Risk Discovery and Seasonality.")
 
 with st.sidebar:
     st.header("Settings")
-    start_date = st.date_input("Historical start date", value=pd.to_datetime("2014-01-01"))
-    match_count = st.slider("Similar historical days", 20, 150, 50, step=10)
+    start_date = st.date_input("Historical start date", value=pd.to_datetime("2014-01-01"), help="Earliest date used for the historical sample.")
+    match_count = st.slider("Similar historical days", 20, 150, 50, step=10, help="How many closest historical analogue days to compare with the selected day.")
     selected_mode = st.radio("Analysis date", ["Latest available day", "Choose date"])
     st.markdown("---")
     st.caption("This version generates signals inside Python. No TradingView connection is needed.")
@@ -593,7 +759,7 @@ try:
     summary = outcome_summary(matches)
     playbook = make_playbook(state, current, summary)
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Today’s Playbook", "Signal Forensics", "Similar Historical Days", "Risk Discovery"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Today’s Playbook", "Signal Forensics", "Similar Historical Days", "Risk Discovery", "Seasonality"])
 
     with tab1:
         st.subheader("Today's SPY Playbook" if selected_mode == "Latest available day" else f"SPY Playbook for {selected_date.date()}")
@@ -609,19 +775,23 @@ try:
         st.success(f"**Playbook:** {playbook}")
 
         st.markdown("### Score breakdown")
+        st.caption("These are context scores, not buy/sell signals. Use them to understand whether the market is clean, stretched, mature, or risky.")
         s1, s2, s3, s4, s5 = st.columns(5)
-        s1.metric("Trend score", f"{current['trend_score']:.1f}")
-        s2.metric("Extension score", f"{current['extension_score']:.1f}")
-        s3.metric("Duration score", f"{current['duration_score']:.1f}")
-        s4.metric("Candle pressure", f"{current['candle_pressure_score']:.1f}")
-        s5.metric("VIX context", f"{current['vix_context_score']:.1f}")
+        s1.metric("Trend score", f"{current['trend_score']:.1f}", help="EMA structure and trend direction. Higher = cleaner uptrend; negative = weaker/bearish trend.")
+        s2.metric("Extension score", f"{current['extension_score']:.1f}", help="How far price is stretched from EMA/bands using ATR. High positive = upside extension/chase risk.")
+        s3.metric("Duration score", f"{current['duration_score']:.1f}", help="How long the move has continued without a meaningful reset or pullback.")
+        s4.metric("Candle pressure", f"{current['candle_pressure_score']:.1f}", help="Range/body/gap pressure measured with ATR. Context decides whether it is ignition or exhaustion.")
+        s5.metric("VIX context", f"{current['vix_context_score']:.1f}", help="Volatility context. Rising/elevated VIX can increase path risk.")
+
+        with st.expander("What do these labels mean?"):
+            st.dataframe(score_explainer_table(), use_container_width=True, hide_index=True)
 
         st.markdown("### Key context features")
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("ATR distance from EMA20", f"{current['atr_dist_ema20']:.2f}")
-        k2.metric("Days above EMA20", f"{int(current['days_above_ema20'])}")
-        k3.metric("Days since 2% pullback", f"{int(current['days_since_2pct_pullback'])}")
-        k4.metric("Weekly green streak", f"{int(current['weekly_green_streak'])}")
+        k1.metric("ATR distance from EMA20", f"{current['atr_dist_ema20']:.2f}", help="How many ATRs price is above/below EMA20. This is more useful than raw percent distance.")
+        k2.metric("Days above EMA20", f"{int(current['days_above_ema20'])}", help="Trend age above the fast EMA. Very high values can mean mature/extended trend.")
+        k3.metric("Days since 2% pullback", f"{int(current['days_since_2pct_pullback'])}", help="How long since SPY had a one-day 2% pullback.")
+        k4.metric("Weekly green streak", f"{int(current['weekly_green_streak'])}", help="How many consecutive weekly closes were higher.")
 
         st.markdown("### Historical analogue outcomes")
         render_summary_metrics(summary)
@@ -730,44 +900,158 @@ try:
         st.subheader("Risk Discovery")
         st.caption("This tab focuses on downside path risk: what happened inside the next few days, not only where SPY finished.")
 
-        risk_horizon = st.selectbox("Forward risk window", [5, 10], index=1)
-        st.markdown("### Path risk for the current similar historical states")
-        st.write("This uses the same analogue matches as Today’s Playbook, but asks: **how often did SPY drop first or suffer a meaningful drawdown inside the window?**")
-        current_risk_summary = outcome_summary(matches.dropna(subset=[f"max_adverse_{risk_horizon}d", f"max_favourable_{risk_horizon}d", f"fwd_ret_{risk_horizon}d"]))
-        render_path_risk_metrics(current_risk_summary, horizon=risk_horizon)
+        risk_horizon = st.selectbox(
+            "Forward risk window",
+            [5, 10],
+            index=1,
+            help="Number of trading days to inspect after the selected day. 5–10D is usually cleaner for this MVP; 30D can mix too many unrelated events."
+        )
 
-        ft = first_touch_stats(df, matches, horizon=risk_horizon, up_threshold=0.01, down_threshold=0.01)
-        f1, f2, f3 = st.columns(3)
-        f1.metric("-1% before +1%", prob(ft["drop_before_gain"]))
-        f2.metric("+1% before -1%", prob(ft["gain_before_drop"]))
-        f3.metric("Neither hit", prob(ft["neither"]))
+        st.markdown("### Path risk for current similar historical states")
+        st.write("This uses the same analogue matches as Today’s Playbook, but asks: **how often did SPY drop first or suffer a meaningful drawdown inside the window?**")
+
+        current_risk_summary = outcome_summary(
+            matches.dropna(subset=[f"max_adverse_{risk_horizon}d", f"max_favourable_{risk_horizon}d", f"fwd_ret_{risk_horizon}d"])
+        )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric(f"{risk_horizon}D final positive", prob(current_risk_summary[f"prob_positive_{risk_horizon}d"]), help="How often similar historical days finished higher after the selected window.")
+        c2.metric(f"Chance of -2% inside {risk_horizon}D", prob(current_risk_summary[f"chance_down_2pct_{risk_horizon}d"]), help="How often price dropped at least 2% at any point inside the selected window.")
+        c3.metric("Worst 10% adverse move", pct(current_risk_summary[f"worst10_adverse_{risk_horizon}d"]), help="Bad-case path risk. In the worst 10% of cases, downside was around this or worse.")
 
         st.warning(f"**Risk label:** {risk_label(current_risk_summary, risk_horizon)}")
 
-        st.markdown("### Risk pattern discovery")
-        st.write("These are broad, predefined risk states. The goal is to find where upside-looking markets historically had poor path quality or high reversal risk.")
-        min_sample = st.slider("Minimum sample size for risk patterns", 20, 100, 30, step=10)
+        with st.expander("Show full path-risk table"):
+            render_clean_path_risk_table(current_risk_summary, horizon=risk_horizon)
+
+        ft = first_touch_stats(df, matches, horizon=risk_horizon, up_threshold=0.01, down_threshold=0.01)
+        st.markdown("### First move test")
+        st.caption("This checks whether SPY usually hit -1% first or +1% first after similar historical states.")
+        ft_df = pd.DataFrame([
+            {"First event inside window": "-1% drop before +1% gain", "Probability": prob(ft["drop_before_gain"]), "Meaning": "Pain first. Bad for chasing entries."},
+            {"First event inside window": "+1% gain before -1% drop", "Probability": prob(ft["gain_before_drop"]), "Meaning": "Reward first. Cleaner entry path."},
+        ])
+        st.dataframe(ft_df, use_container_width=True, hide_index=True)
+
+        st.markdown("### Downside risk pattern discovery")
+        st.write("These are broad predefined risk states. The goal is to find where upside-looking markets historically had poor path quality or higher pullback/reversal risk.")
+        min_sample = st.slider(
+            "Minimum historical occurrences",
+            20,
+            100,
+            30,
+            step=10,
+            help="Minimum number of historical times a risk pattern must have appeared before it is shown. Higher = more reliable, but fewer patterns."
+        )
         risk_table, baseline_summary = risk_pattern_table(df.loc[df.index <= selected_date].copy(), horizon=risk_horizon, min_sample=min_sample)
 
-        st.markdown("#### Baseline SPY path risk")
-        render_path_risk_metrics(baseline_summary, horizon=risk_horizon, prefix="Baseline ")
+        with st.expander("Baseline SPY path risk for comparison"):
+            render_clean_path_risk_table(baseline_summary, horizon=risk_horizon, baseline=True)
 
         if risk_table.empty:
-            st.info("No risk patterns met the minimum sample-size filter. Try lowering the minimum sample size.")
+            st.info("No risk patterns met the minimum historical occurrence filter. Try lowering the minimum.")
         else:
             show_risk = risk_table.copy()
+            show_risk = show_risk.rename(columns={
+                "risk_pattern": "risk pattern",
+                "sample_size": "historical occurrences",
+                "final_positive_rate": f"{risk_horizon}D positive rate",
+                "baseline_positive_rate": "baseline positive rate",
+                "median_final_return": f"median {risk_horizon}D return",
+                "chance_-1%": f"chance -1% inside {risk_horizon}D",
+                "chance_-2%": f"chance -2% inside {risk_horizon}D",
+                "chance_-3%": f"chance -3% inside {risk_horizon}D",
+                "median_max_adverse": "median max adverse",
+                "worst10_adverse": "worst 10% adverse",
+                "reward_to_pain": "reward/pain",
+                "drop_1%_before_gain_1%": "-1% before +1%",
+                "risk_label": "risk label",
+                "excess_-2%_risk_vs_baseline": "extra -2% risk vs baseline",
+            })
             percent_cols = [
-                "final_positive_rate", "baseline_positive_rate", "median_final_return",
-                "chance_-1%", "chance_-2%", "chance_-3%", "median_max_adverse",
-                "worst10_adverse", "drop_1%_before_gain_1%", "excess_-2%_risk_vs_baseline"
+                f"{risk_horizon}D positive rate", "baseline positive rate", f"median {risk_horizon}D return",
+                f"chance -1% inside {risk_horizon}D", f"chance -2% inside {risk_horizon}D", f"chance -3% inside {risk_horizon}D",
+                "median max adverse", "worst 10% adverse", "-1% before +1%", "extra -2% risk vs baseline"
             ]
             for col in percent_cols:
-                show_risk[col] = show_risk[col].map(lambda x: "N/A" if pd.isna(x) else f"{x*100:.2f}%")
-            show_risk["reward_to_pain"] = show_risk["reward_to_pain"].map(lambda x: "N/A" if pd.isna(x) else f"{x:.2f}")
-            st.dataframe(show_risk, use_container_width=True)
+                if col in show_risk.columns:
+                    show_risk[col] = show_risk[col].map(lambda x: "N/A" if pd.isna(x) else f"{x*100:.2f}%")
+            if "reward/pain" in show_risk.columns:
+                show_risk["reward/pain"] = show_risk["reward/pain"].map(lambda x: "N/A" if pd.isna(x) else f"{x:.2f}")
+            st.dataframe(show_risk, use_container_width=True, hide_index=True)
 
         st.markdown("### How to read this tab")
-        st.write("A setup can have a positive 10D final return and still be a bad entry if the median or worst adverse move is large. This tab is designed to expose that hidden path risk.")
+        st.info("A setup can finish positive after 10 days and still be a bad entry if it usually drops hard first. This tab exposes that hidden path risk.")
+
+    with tab5:
+        st.subheader("Seasonality by market condition")
+        st.caption("This checks whether calendar tendencies still appear after filtering by market condition. It is not meant to use old seasonality blindly.")
+
+        s_col1, s_col2, s_col3, s_col4 = st.columns(4)
+        season_horizon = s_col1.selectbox("Forward window", [1, 3, 5, 10], index=2, help="Return/path-risk window after each calendar date.")
+        group_by = s_col2.selectbox("Group by", ["Weekday", "Month", "Day of month", "Week of year"], index=0)
+        condition_name = s_col3.selectbox(
+            "Market condition filter",
+            [
+                "All market days",
+                "Current exact market state",
+                "Bullish regime",
+                "Bearish regime",
+                "Upside extension",
+                "Extreme upside extension",
+                "Oversold / downside stretch",
+                "Pullback in uptrend",
+            ],
+            index=0,
+            help="Lets you test whether day/month seasonality changes in bullish, bearish, extended, or pullback conditions."
+        )
+        season_min_sample = s_col4.slider("Minimum occurrences", 10, 100, 20, step=10, help="Minimum sample count for each weekday/month/day bucket.")
+
+        season_table, season_baseline, filtered_count = seasonality_table(
+            df, selected_date, horizon=season_horizon, condition_name=condition_name, group_by=group_by, min_sample=season_min_sample
+        )
+
+        st.markdown("### Baseline inside selected condition")
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("Filtered historical days", f"{filtered_count}")
+        b2.metric(f"Baseline {season_horizon}D positive", prob(season_baseline[f"prob_positive_{season_horizon}d"]))
+        b3.metric(f"Baseline median {season_horizon}D return", pct(season_baseline[f"median_{season_horizon}d"]))
+        b4.metric(f"Baseline -2% path risk", prob(season_baseline[f"chance_down_2pct_{season_horizon}d"]))
+
+        if season_table.empty:
+            st.info("No seasonality buckets met the minimum occurrence filter. Try lowering the minimum or using a broader market condition.")
+        else:
+            display = season_table.copy()
+            percent_cols = ["positive_rate", "baseline_positive_rate", "edge_vs_condition", "median_return", "chance_-2%_inside", "median_max_adverse", "worst10_adverse"]
+            for col in percent_cols:
+                display[col] = display[col].map(lambda x: "N/A" if pd.isna(x) else f"{x*100:.2f}%")
+            display = display.rename(columns={
+                "period": "period",
+                "sample_size": "historical occurrences",
+                "positive_rate": f"{season_horizon}D positive rate",
+                "baseline_positive_rate": "condition baseline",
+                "edge_vs_condition": "edge vs same condition",
+                "median_return": f"median {season_horizon}D return",
+                "chance_-2%_inside": f"chance -2% inside {season_horizon}D",
+                "median_max_adverse": "median max adverse",
+                "worst10_adverse": "worst 10% adverse",
+            })
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
+        with st.expander("How to read Seasonality"):
+            st.write("""
+Seasonality here means: **does a weekday/month behave differently after controlling for market condition?**
+
+The important column is **edge vs same condition**.  
+Example: if Thursdays are bearish overall, this checks whether Thursdays are still bearish inside bullish regimes, bearish regimes, upside extensions, etc.
+
+Do not treat a calendar pattern as meaningful just because one bucket is high. Check:
+- historical occurrences
+- edge vs same condition
+- median return
+- path risk
+- whether the sample is large enough
+""")
 
     st.caption(
         "Research prototype only. It shows historical analogue outcomes; it does not predict future prices or provide financial advice."
